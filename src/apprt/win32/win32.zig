@@ -662,6 +662,19 @@ pub extern "user32" fn SetLayeredWindowAttributes(
     dwFlags: u32,
 ) callconv(.winapi) i32;
 
+// RedrawWindow — needed after clearing WS_EX_LAYERED: the style change is
+// not repainted automatically (see "Layered Windows" in the Win32 docs).
+pub const RDW_INVALIDATE: u32 = 0x0001;
+pub const RDW_ERASE: u32 = 0x0004;
+pub const RDW_ALLCHILDREN: u32 = 0x0080;
+pub const RDW_FRAME: u32 = 0x0400;
+pub extern "user32" fn RedrawWindow(
+    hWnd: ?HWND,
+    lprcUpdate: ?*const RECT,
+    hrgnUpdate: ?*anyopaque,
+    flags: u32,
+) callconv(.winapi) i32;
+
 pub extern "user32" fn SetTimer(
     hWnd: ?HWND,
     nIDEvent: usize,

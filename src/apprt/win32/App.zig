@@ -928,8 +928,18 @@ pub fn performAction(
                     if (core_surface.rt_surface.parent_window.hwnd) |h| {
                         const current_ex = w32.GetWindowLongW(h, w32.GWL_EXSTYLE);
                         if (current_ex & w32.WS_EX_LAYERED != 0) {
-                            // Remove layered style (restore full opacity)
+                            // Remove layered style (restore full opacity).
+                            // Clearing WS_EX_LAYERED is not repainted
+                            // automatically — without an explicit redraw the
+                            // window stays translucent until the next
+                            // repaint (e.g. a later focus change).
                             _ = w32.SetWindowLongW(h, w32.GWL_EXSTYLE, current_ex & ~w32.WS_EX_LAYERED);
+                            _ = w32.RedrawWindow(
+                                h,
+                                null,
+                                null,
+                                w32.RDW_ERASE | w32.RDW_INVALIDATE | w32.RDW_FRAME | w32.RDW_ALLCHILDREN,
+                            );
                         } else {
                             // Apply opacity from config
                             _ = w32.SetWindowLongW(h, w32.GWL_EXSTYLE, current_ex | w32.WS_EX_LAYERED);
