@@ -125,6 +125,16 @@ The executable is at `zig-out/bin/ghostty.exe`. Building with the native
 Windows Zig toolchain is the most reliable path and is also the
 authoritative compile check.
 
+The `-Dtarget=x86_64-windows-gnu` flag matters even on Windows: with the
+GNU ABI Zig provides its own bundled libc (MinGW), whereas omitting the
+target selects the MSVC ABI, which requires an installed Visual Studio /
+Windows SDK and otherwise fails every C dependency with
+`error: failed to find libc installation: WindowsSdkNotFound`.
+
+To replace a `ghostty.exe` that is currently running, rename the old file
+aside first — Windows write-locks a running executable against overwrite
+but still allows it to be renamed.
+
 ### Cross-compile from Linux/WSL2
 
 The same command works from Linux with the GNU ABI target
