@@ -1476,9 +1476,22 @@ pub const ReadThread = struct {
                         // Check for a quit signal
                         .OPERATION_ABORTED => break,
 
+                        // This means our pty is closed. We're probably
+                        // gracefully shutting down.
+                        .BROKEN_PIPE,
+                        .HANDLE_EOF,
+                        .PIPE_NOT_CONNECTED,
+                        => {
+                            log.info("io reader exiting", .{});
+                            return;
+                        },
+
+                        // Never crash on unexpected errors; child exit is
+                        // detected separately by the process watcher, so
+                        // exiting the read thread is always safe.
                         else => {
                             log.err("io reader error err={}", .{err});
-                            unreachable;
+                            return;
                         },
                     }
                 }
@@ -1489,8 +1502,8 @@ pub const ReadThread = struct {
             var quit_bytes: windows.DWORD = 0;
             if (windows.exp.kernel32.PeekNamedPipe(quit, null, 0, null, &quit_bytes, null) == 0) {
                 const err = windows.kernel32.GetLastError();
-                log.err("quit pipe reader error err={}", .{err});
-                unreachable;
+                log.warn("quit pipe peek failed on read thread, exiting early err={}", .{err});
+                return;
             }
 
             if (quit_bytes > 0) {
