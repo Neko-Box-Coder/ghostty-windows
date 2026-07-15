@@ -54,6 +54,13 @@ pub const min_window_height_cells: u32 = 4;
 /// given time. `activate_key_table` calls after this are ignored.
 const max_active_key_tables = 8;
 
+/// How long a push to the renderer mailbox may block before we drop
+/// the message. These pushes happen on the GUI thread; if the renderer
+/// thread is wedged (e.g. blocked in a buffer swap after system sleep)
+/// an unbounded push would freeze the whole app, so we bound the wait
+/// and degrade to a dropped message instead.
+const mailbox_timeout_ns: u64 = 1 * std.time.ns_per_s;
+
 /// Unique ID used to identify this surface for IPC purposes. It is
 /// exposed to the commands running in surfaces as the environment variable
 /// GHOSTTY_SURFACE_ID. It must not be zero as zero is used to incicate a null
@@ -93,6 +100,12 @@ renderer_thread: rendererpkg.Thread,
 
 /// The actual thread
 renderer_thr: std.Thread,
+
+/// Set when deinit gave up waiting for a wedged surface thread (Windows
+/// only) and returned early without freeing any thread-reachable state.
+/// The apprt must then skip its own teardown of anything those threads
+/// can still touch, including the surface allocation itself.
+deinit_leaked: bool = false,
 
 /// Mouse state.
 mouse: Mouse,
@@ -153,6 +166,12 @@ child_exited: bool = false,
 /// If we're not initially focused then apprts can call focusCallback
 /// to let us know.
 focused: bool = true,
+
+/// False when the last focus push to the renderer mailbox was dropped
+/// (bounded push timed out on a full queue). Lets focusCallback bypass
+/// its equality guard so a repeated same-state call can re-deliver the
+/// focus state once the renderer recovers.
+renderer_focus_delivered: bool = true,
 
 /// Used to determine whether to continuously scroll.
 selection_scroll_active: bool = false,
@@ -810,25 +829,82 @@ pub fn init(
     app.first = false;
 }
 
-pub fn deinit(self: *Surface) void {
-    // Stop search thread
-    if (self.search) |*s| s.deinit();
+/// How long deinit waits for a surface thread to exit on Windows before
+/// treating it as wedged and leaking the surface instead of freeing it.
+const deinit_join_timeout_ms = 2_000;
 
-    // Stop rendering thread
-    {
-        self.renderer_thread.stop.notify() catch |err|
-            log.err("error notifying renderer thread to stop, may stall err={}", .{err});
-        self.renderer_thr.join();
-
-        // We need to become the active rendering thread again
-        self.renderer.threadEnter(self.rt_surface) catch unreachable;
+/// Join a surface thread, but on Windows give up after
+/// deinit_join_timeout_ms so a wedged renderer thread (e.g. blocked
+/// forever inside SwapBuffers) can't hang the GUI thread. Returns false
+/// if the thread did not exit in time; the caller must then leak all
+/// state the thread can reach. On non-Windows this is a plain join.
+fn joinBounded(thr: std.Thread) bool {
+    if (comptime builtin.os.tag != .windows) {
+        thr.join();
+        return true;
     }
 
+    std.os.windows.WaitForSingleObject(thr.getHandle(), deinit_join_timeout_ms) catch {
+        // Timeout (or WaitAbandoned/Unexpected): treat as wedged. Detach so
+        // the thread self-frees its std.Thread allocation if it ever unwedges.
+        thr.detach();
+        return false;
+    };
+    thr.join(); // instant: the OS handle is already signaled
+    return true;
+}
+
+pub fn deinit(self: *Surface) void {
+    // Stop search thread. Bounded like the joins below: the search
+    // thread pushes into the renderer mailbox, so a wedged renderer can
+    // stall it (for the push timeout per message) and an unbounded join
+    // here would hold up the GUI thread with it.
+    const search_ok = ok: {
+        const s = if (self.search) |*s| s else break :ok true;
+        s.state.stop.notify() catch |err| log.err(
+            "error notifying search thread to stop, may stall err={}",
+            .{err},
+        );
+        if (!joinBounded(s.thread)) break :ok false;
+        s.state.deinit();
+        break :ok true;
+    };
+
+    // Stop rendering thread
+    const renderer_ok = ok: {
+        self.renderer_thread.stop.notify() catch |err|
+            log.err("error notifying renderer thread to stop, may stall err={}", .{err});
+        if (!joinBounded(self.renderer_thr)) break :ok false;
+
+        // We need to become the active rendering thread again. This can
+        // fail if GPU context-loss recovery left the GL context in an
+        // unusable state; treat that like a wedged renderer and leak
+        // rather than tear down GPU resources with no usable context.
+        self.renderer.threadEnter(self.rt_surface) catch |err| {
+            log.err("error entering renderer context in deinit, leaking err={}", .{err});
+            break :ok false;
+        };
+        break :ok true;
+    };
+
     // Stop our IO thread
-    {
+    const io_ok = ok: {
         self.io_thread.stop.notify() catch |err|
             log.err("error notifying io thread to stop, may stall err={}", .{err});
-        self.io_thr.join();
+        break :ok joinBounded(self.io_thr);
+    };
+
+    if (!renderer_ok or !io_ok or !search_ok) {
+        // Release the render context we made current above; the wedged
+        // thread may still need it and we free nothing it can reach.
+        if (renderer_ok) self.renderer.threadExit();
+
+        // A wedged thread can still dereference nearly all surface state
+        // (renderer impl, xev loop+mailbox, terminal, renderer_state.mutex,
+        // preedit, font grid atlas), so leak everything rather than free.
+        self.deinit_leaked = true;
+        log.err("surface thread wedged in deinit; leaking surface resources addr={x}", .{@intFromPtr(self)});
+        return;
     }
 
     // We need to deinit AFTER everything is stopped, since there are
@@ -930,7 +1006,10 @@ pub fn activateInspector(self: *Surface) !void {
     }
 
     // Notify our components we have an inspector active
-    _ = self.renderer_thread.mailbox.push(.{ .inspector = true }, .{ .forever = {} });
+    if (self.renderer_thread.mailbox.push(
+        .{ .inspector = true },
+        .{ .ns = mailbox_timeout_ns },
+    ) == 0) log.warn("renderer mailbox full, dropped inspector activation", .{});
     self.queueIo(.{ .inspector = true }, .unlocked);
 }
 
@@ -947,7 +1026,10 @@ pub fn deactivateInspector(self: *Surface) void {
     }
 
     // Notify our components we have deactivated inspector
-    _ = self.renderer_thread.mailbox.push(.{ .inspector = false }, .{ .forever = {} });
+    if (self.renderer_thread.mailbox.push(
+        .{ .inspector = false },
+        .{ .ns = mailbox_timeout_ns },
+    ) == 0) log.warn("renderer mailbox full, dropped inspector deactivation", .{});
     self.queueIo(.{ .inspector = false }, .unlocked);
 
     // Deinit the inspector
@@ -1458,43 +1540,62 @@ fn searchCallback_(
             const matches = try alloc.dupe(terminal.highlight.Flattened, matches_unowned);
             for (matches) |*m| m.* = try m.clone(alloc);
 
-            _ = self.renderer_thread.mailbox.push(
+            // Bounded push: a wedged renderer must not block the search
+            // thread forever, or Surface.deinit's search join stalls the
+            // GUI thread with it. On drop the renderer never took
+            // ownership of the arena, so free it here.
+            if (self.renderer_thread.mailbox.push(
                 .{ .search_viewport_matches = .{
                     .arena = arena,
                     .matches = matches,
                 } },
-                .forever,
-            );
+                .{ .ns = mailbox_timeout_ns },
+            ) == 0) {
+                log.warn("renderer mailbox full, dropped search matches", .{});
+                arena.deinit();
+                self.renderer_thread.wakeup.notify() catch {};
+                return;
+            }
             try self.renderer_thread.wakeup.notify();
         },
 
         .selected_match => |selected_| {
             if (selected_) |sel| {
+                // Send the selected index to the surface mailbox
+                _ = self.surfaceMailbox().push(
+                    .{ .search_selected = sel.idx },
+                    .forever,
+                );
+
                 // Copy the flattened match.
                 var arena: ArenaAllocator = .init(self.alloc);
                 errdefer arena.deinit();
                 const alloc = arena.allocator();
                 const match = try sel.highlight.clone(alloc);
 
-                _ = self.renderer_thread.mailbox.push(
+                // Bounded push, same rationale as viewport_matches; on
+                // drop the arena is still ours to free.
+                if (self.renderer_thread.mailbox.push(
                     .{ .search_selected_match = .{
                         .arena = arena,
                         .match = match,
                     } },
-                    .forever,
-                );
-
-                // Send the selected index to the surface mailbox
-                _ = self.surfaceMailbox().push(
-                    .{ .search_selected = sel.idx },
-                    .forever,
-                );
+                    .{ .ns = mailbox_timeout_ns },
+                ) == 0) {
+                    log.warn("renderer mailbox full, dropped selected search match", .{});
+                    arena.deinit();
+                    self.renderer_thread.wakeup.notify() catch {};
+                    return;
+                }
             } else {
-                // Reset our selected match
-                _ = self.renderer_thread.mailbox.push(
+                // Reset our selected match. Bounded push; no payload to
+                // free on drop.
+                if (self.renderer_thread.mailbox.push(
                     .{ .search_selected_match = null },
-                    .forever,
-                );
+                    .{ .ns = mailbox_timeout_ns },
+                ) == 0) {
+                    log.warn("renderer mailbox full, dropped selected match reset", .{});
+                }
 
                 // Reset the selected index
                 _ = self.surfaceMailbox().push(
@@ -1514,18 +1615,25 @@ fn searchCallback_(
         },
 
         // When we quit, tell our renderer to reset any search state.
+        // Bounded pushes: neither message owns memory (the arena below
+        // is empty), so a drop loses nothing but a redraw of highlights
+        // that a wedged renderer wasn't drawing anyway.
         .quit => {
-            _ = self.renderer_thread.mailbox.push(
+            if (self.renderer_thread.mailbox.push(
                 .{ .search_selected_match = null },
-                .forever,
-            );
-            _ = self.renderer_thread.mailbox.push(
+                .{ .ns = mailbox_timeout_ns },
+            ) == 0) {
+                log.warn("renderer mailbox full, dropped search reset", .{});
+            }
+            if (self.renderer_thread.mailbox.push(
                 .{ .search_viewport_matches = .{
                     .arena = .init(self.alloc),
                     .matches = &.{},
                 } },
-                .forever,
-            );
+                .{ .ns = mailbox_timeout_ns },
+            ) == 0) {
+                log.warn("renderer mailbox full, dropped search reset", .{});
+            }
             try self.renderer_thread.wakeup.notify();
 
             // Reset search totals in the surface
@@ -1809,7 +1917,17 @@ pub fn updateConfig(
     termio_config_ptr.* = try termio.Termio.DerivedConfig.init(self.alloc, config);
     errdefer termio_config_ptr.deinit();
 
-    _ = self.renderer_thread.mailbox.push(renderer_message, .{ .forever = {} });
+    if (self.renderer_thread.mailbox.push(
+        renderer_message,
+        .{ .ns = mailbox_timeout_ns },
+    ) == 0) {
+        log.warn("renderer mailbox full, dropped config change", .{});
+        renderer_message.deinit();
+
+        // Replace the message with one that owns no memory so that
+        // the errdefer above can't deinit twice if a later call fails.
+        renderer_message = .reset_cursor_blink;
+    }
     self.queueIo(.{
         .change_config = .{
             .alloc = self.alloc,
@@ -2450,7 +2568,10 @@ fn setCellSize(self: *Surface, size: rendererpkg.CellSize) !void {
 pub fn setFontSize(self: *Surface, size: font.face.DesiredSize) !void {
     log.debug("set font size size={}", .{size.points});
 
-    // Update our font size so future changes work
+    // Update our font size so future changes work. Remember the old
+    // size so we can roll back if the renderer never accepts the new
+    // grid (dropped mailbox push below).
+    const old_font_size = self.font_size;
     self.font_size = size;
 
     // We need to build up a new font stack for this font size.
@@ -2467,15 +2588,31 @@ pub fn setFontSize(self: *Surface, size: font.face.DesiredSize) !void {
     });
 
     // Notify our render thread of the new font stack. The renderer
-    // MUST accept the new font grid and deref the old.
-    _ = self.renderer_thread.mailbox.push(.{
+    // MUST accept the new font grid and deref the old. If the mailbox
+    // is full we drop the message, release our new ref so the renderer
+    // keeps its (still-reffed) old grid with consistent accounting, and
+    // roll back the font size and cell size committed above so the
+    // terminal/PTY layout doesn't diverge from the grid the renderer
+    // keeps drawing with.
+    if (self.renderer_thread.mailbox.push(.{
         .font_grid = .{
             .grid = font_grid,
             .set = &self.app.font_grid_set,
             .old_key = self.font_grid_key,
             .new_key = font_grid_key,
         },
-    }, .{ .forever = {} });
+    }, .{ .ns = mailbox_timeout_ns }) == 0) {
+        log.warn("renderer mailbox full, dropped font grid change", .{});
+        self.app.font_grid_set.deref(font_grid_key);
+        self.font_size = old_font_size;
+        self.setCellSize(.{
+            .width = self.font_metrics.cell_width,
+            .height = self.font_metrics.cell_height,
+        }) catch |err| {
+            log.warn("error rolling back cell size err={}", .{err});
+        };
+        return;
+    }
 
     // Once we've sent the key we can replace our key
     self.font_grid_key = font_grid_key;
@@ -3344,10 +3481,18 @@ pub fn occlusionCallback(self: *Surface, visible: bool) !void {
     crash.sentry.thread_state = self.crashThreadState();
     defer crash.sentry.thread_state = null;
 
-    _ = self.renderer_thread.mailbox.push(.{
+    const delivered = self.renderer_thread.mailbox.push(.{
         .visible = visible,
-    }, .{ .forever = {} });
+    }, .{ .ns = mailbox_timeout_ns }) != 0;
     try self.queueRender();
+
+    // Surface the drop to the apprt: producers that dedupe visibility
+    // (win32 setVisible) must know the state was NOT delivered so they
+    // can retry on the next call instead of latching it as sent.
+    if (!delivered) {
+        log.warn("renderer mailbox full, dropped visibility change", .{});
+        return error.MailboxFull;
+    }
 }
 
 pub fn focusCallback(self: *Surface, focused: bool) !void {
@@ -3359,20 +3504,25 @@ pub fn focusCallback(self: *Surface, focused: bool) !void {
     // the first surface created.
     if (focused) self.app.focusSurface(self);
 
-    // If our focus state is unchanged we do nothing else.
-    if (self.focused == focused) return;
+    // If our focus state is unchanged we do nothing else — unless the
+    // last focus push was dropped, in which case a same-state call is
+    // our retry opportunity.
+    if (self.focused == focused and self.renderer_focus_delivered) return;
     self.focused = focused;
 
     // Notify our render thread of the new state
-    _ = self.renderer_thread.mailbox.push(.{
+    self.renderer_focus_delivered = self.renderer_thread.mailbox.push(.{
         .focus = focused,
-    }, .{ .forever = {} });
+    }, .{ .ns = mailbox_timeout_ns }) != 0;
+    if (!self.renderer_focus_delivered) {
+        log.warn("renderer mailbox full, dropped focus change", .{});
+    }
 
     // Wake the renderer so it drains the mailbox. Without this, an
     // unfocused renderer (cursor blink timer canceled in Thread.zig
     // setFocus path) has no wake source, and successive focus pushes
-    // accumulate until the 64-slot mailbox fills and the next push
-    // blocks the UI thread forever.
+    // accumulate until the 64-slot mailbox fills and further pushes
+    // stall for the push timeout and drop.
     try self.queueRender();
 
     if (!focused) unfocused: {

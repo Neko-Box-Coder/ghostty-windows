@@ -7,6 +7,12 @@ const BlockingQueue = @import("../datastruct/main.zig").BlockingQueue;
 
 const log = std.log.scoped(.io_writer);
 
+/// How long the slow-path send may block waiting for the IO thread to
+/// drain a full queue before dropping the message. Blocking forever
+/// here would freeze the caller (the GUI thread) if the IO thread is
+/// wedged.
+const send_timeout_ns: u64 = 1 * std.time.ns_per_s;
+
 /// A queue used for storing messages that is periodically drained.
 /// Typically used by a multi-threaded application. The capacity is
 /// hardcoded to a value that empirically has made sense for Ghostty usage
@@ -89,7 +95,20 @@ pub const Mailbox = union(enum) {
                 // here.
                 if (mutex) |m| m.unlock();
                 defer if (mutex) |m| m.lock();
-                _ = mb.queue.push(msg, .{ .forever = {} });
+                if (mb.queue.push(msg, .{ .ns = send_timeout_ns }) == 0) {
+                    log.err("io mailbox full, message dropped (data loss)", .{});
+
+                    // The consumer never took ownership, so free any
+                    // payload the message owns.
+                    switch (msg) {
+                        .write_alloc => |v| v.alloc.free(v.data),
+                        .change_config => |v| {
+                            v.ptr.deinit();
+                            v.alloc.destroy(v.ptr);
+                        },
+                        else => {},
+                    }
+                }
             },
         }
     }

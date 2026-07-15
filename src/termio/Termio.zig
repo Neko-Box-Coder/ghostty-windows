@@ -23,6 +23,11 @@ const ProcessInfo = @import("../pty.zig").ProcessInfo;
 
 const log = std.log.scoped(.io_exec);
 
+/// How long a push to the renderer mailbox may block before we drop
+/// the message. Blocking forever would wedge the IO thread whenever
+/// the renderer thread stops draining its mailbox.
+const renderer_mailbox_timeout_ns: u64 = 1 * std.time.ns_per_s;
+
 /// Mutex state argument for queueMessage.
 pub const MutexState = enum { locked, unlocked };
 
@@ -501,7 +506,10 @@ pub fn resize(
     }
 
     // Mail the renderer so that it can update the GPU and re-render
-    _ = self.renderer_mailbox.push(.{ .resize = size }, .{ .forever = {} });
+    if (self.renderer_mailbox.push(
+        .{ .resize = size },
+        .{ .ns = renderer_mailbox_timeout_ns },
+    ) == 0) log.warn("renderer mailbox full, dropped resize", .{});
     self.renderer_wakeup.notify() catch {};
 }
 
@@ -675,9 +683,9 @@ fn processOutputLocked(self: *Termio, buf: []const u8) void {
             // unfocused renderer (cursor blink timer canceled in
             // renderer/Thread.zig setFocus path) has no periodic wake source,
             // and these reset_cursor_blink messages accumulate at up to
-            // 2/sec until the 64-slot mailbox is full — at which point the
-            // next blocking push (e.g. focusCallback's .focus message) hangs
-            // the UI thread forever.
+            // 2/sec until the 64-slot mailbox is full — at which point
+            // bounded pushes (e.g. focusCallback's .focus message) stall
+            // for their timeout and drop.
             self.renderer_wakeup.notify() catch {};
         }
     } else |err| {
