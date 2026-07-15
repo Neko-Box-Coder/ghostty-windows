@@ -19,6 +19,13 @@ const log = std.log.scoped(.renderer_thread);
 const DRAW_INTERVAL = 8; // 120 FPS
 const CURSOR_BLINK_INTERVAL = 600;
 
+/// Consecutive unhealthy/errored frames before we attempt GPU
+/// context-loss recovery, and the number of recovery attempts before
+/// we give up and leave the surface frozen. Only used on apprts that
+/// can recreate the GL context (win32/WGL).
+const UNHEALTHY_FRAMES_BEFORE_RECOVERY = 3;
+const MAX_CONTEXT_RECOVERIES = 3;
+
 /// Whether calls to `drawFrame` must be done from the app thread.
 ///
 /// If this is `true` then we send a `redraw_surface` message to the apprt
@@ -90,6 +97,12 @@ app_mailbox: App.Mailbox,
 
 /// Configuration we need derived from the main config.
 config: DerivedConfig,
+
+/// Count of consecutive drawFrame calls that errored or completed
+/// unhealthy, and the number of GPU context-loss recoveries attempted.
+/// Only used on apprts that can recreate the GL context (win32/WGL).
+unhealthy_frames: u8 = 0,
+context_recoveries: u8 = 0,
 
 flags: packed struct {
     /// This is true when a blinking cursor should be visible and false
@@ -511,8 +524,32 @@ fn drawFrame(self: *Thread, now: bool) void {
             .{ .instant = {} },
         );
     } else {
-        self.renderer.drawFrame(false) catch |err|
+        var errored = false;
+        self.renderer.drawFrame(false) catch |err| {
+            errored = true;
             log.warn("error drawing err={}", .{err});
+        };
+
+        // On apprts where we own the GL context (win32/WGL), a run of
+        // consecutive errored or unhealthy frames means the context was
+        // likely lost (driver reset/TDR), so we tear it down and
+        // recreate it. The health atomic is safe to read here because
+        // GL frame completion is synchronous: it was set on this thread
+        // during the drawFrame above.
+        if (comptime @hasDecl(apprt.Surface, "recreateGLContext")) {
+            if (errored or self.renderer.health.load(.seq_cst) == .unhealthy) {
+                self.unhealthy_frames +|= 1;
+                if (self.unhealthy_frames >= UNHEALTHY_FRAMES_BEFORE_RECOVERY and
+                    self.context_recoveries < MAX_CONTEXT_RECOVERIES)
+                {
+                    self.unhealthy_frames = 0;
+                    self.context_recoveries += 1;
+                    self.recoverContext();
+                }
+            } else {
+                self.unhealthy_frames = 0;
+            }
+        }
     }
 
     // Signal the apprt that a frame has been presented. On Win32
@@ -521,6 +558,59 @@ fn drawFrame(self: *Thread, now: bool) void {
     if (comptime @hasDecl(apprt.Surface, "signalFrameDrawn")) {
         self.surface.signalFrameDrawn();
     }
+}
+
+/// Attempt to recover from a lost GPU context (driver reset/TDR) by
+/// tearing down all GPU state, recreating the GL context, and
+/// rebuilding. Runs entirely on the renderer thread. Only referenced
+/// on apprts with recreateGLContext (win32), so it is never analyzed
+/// elsewhere. If any step fails we return; the swap chain is left
+/// defunct so subsequent drawFrames error harmlessly until the next
+/// (bounded) recovery attempt.
+fn recoverContext(self: *Thread) void {
+    log.warn("renderer unhealthy, attempting GPU context recovery", .{});
+
+    // Tear down all GPU state. The old (lost) context is still
+    // current, so the GL deletes are no-ops or harmless errors.
+    self.renderer.displayUnrealized();
+
+    // Recreate the GL context and make it current on this thread.
+    self.surface.recreateGLContext() catch |err| {
+        log.warn("error recreating GL context err={}", .{err});
+        return;
+    };
+
+    // Reload GL function pointers for the new context. On failure the
+    // GL function pointers may be poisoned (GLAD unloads on error), so
+    // release the context via threadExit: subsequent drawFrames then
+    // fail cleanly at surfaceSize (no current context) before making
+    // any GL calls.
+    self.renderer.threadEnter(self.surface) catch |err| {
+        log.warn("error in threadEnter during context recovery err={}", .{err});
+        self.renderer.threadExit();
+        return;
+    };
+
+    // Reset renderer state that still references the lost context.
+    // This MUST run before displayRealized: it issues glDeletes on
+    // texture names captured in the lost context, and right now the
+    // fresh context has no live names so those deletes are silently
+    // ignored. After displayRealized the fresh context reuses the same
+    // low names for the new atlas/target textures and the deletes
+    // would destroy them.
+    self.renderer.rebuildAfterContextLoss();
+
+    // Rebuild the swap chain and shaders.
+    self.renderer.displayRealized() catch |err| {
+        log.warn("error in displayRealized during context recovery err={}", .{err});
+        return;
+    };
+
+    // Draw immediately; a healthy frame flips the health atomic back
+    // and notifies the surface.
+    self.renderer.drawFrame(true) catch |err| {
+        log.warn("error drawing after context recovery err={}", .{err});
+    };
 }
 
 fn wakeupCallback(

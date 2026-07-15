@@ -176,6 +176,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// The images that we may render.
         images: ImageState = .empty,
 
+        /// Set during GPU context-loss recovery so the next updateFrame
+        /// marks the terminal's kitty image state dirty, forcing the
+        /// CPU-side image data to be re-prepped and re-uploaded to the
+        /// new context. Never set on apprts without context recovery.
+        force_kitty_dirty: bool = false,
+
         /// Background image, if we have one.
         bg_image: ?imagepkg.Image = null,
         /// Set whenever the background image changes, signalling
@@ -983,6 +989,47 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.shaders.deinit(self.alloc);
         }
 
+        /// This is called by the win32 apprt renderer thread during GPU
+        /// context-loss recovery, after the fresh context is current but
+        /// BEFORE `displayRealized` rebuilds the swap chain and shaders.
+        /// It drops the kitty images, background image, and last
+        /// presented target, whose stale GL names from the lost context
+        /// would error on every frame. The ordering is load-bearing: the
+        /// glDeletes on stale names are silently ignored only while the
+        /// fresh context has no live names; once displayRealized
+        /// allocates textures the same low names are reused and these
+        /// deletes would destroy them.
+        pub fn rebuildAfterContextLoss(self: *Self) void {
+            self.draw_mutex.lock();
+            defer self.draw_mutex.unlock();
+
+            // If our API holds on to presented state, let it know.
+            if (@hasDecl(GraphicsAPI, "contextLost")) self.api.contextLost();
+
+            // Drop all image state. The kitty storage retains the image
+            // data CPU-side, so forcing it dirty makes the next
+            // updateFrame re-prep and re-upload everything.
+            self.images.deinit(self.alloc);
+            self.images = .empty;
+            self.force_kitty_dirty = true;
+
+            // Reload the background image from scratch.
+            if (self.bg_image) |img| {
+                img.deinit(self.alloc);
+                self.bg_image = null;
+                self.prepBackgroundImage() catch |err| {
+                    log.warn(
+                        "error reloading background image after context loss err={}",
+                        .{err},
+                    );
+                };
+            }
+
+            // Force a full rebuild and redraw.
+            self.markDirty();
+            self.cells_rebuilt = true;
+        }
+
         fn displayLinkCallback(
             _: *macos.video.DisplayLink,
             ud: ?*xev.Async,
@@ -1220,6 +1267,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     const p = state.preedit orelse break :preedit null;
                     break :preedit try p.clone(arena_alloc);
                 };
+
+                // If we're recovering from GPU context loss, mark the kitty
+                // image state dirty so the update below re-preps and
+                // re-uploads the CPU-side image data to the new context.
+                if (self.force_kitty_dirty) {
+                    state.terminal.screens.active.kitty_images.dirty = true;
+                    self.force_kitty_dirty = false;
+                }
 
                 // If we have Kitty graphics data, we enter a SLOW SLOW SLOW path.
                 // We only do this if the Kitty image state is dirty meaning only if

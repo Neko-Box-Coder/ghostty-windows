@@ -308,15 +308,22 @@ pub fn displayRealized(self: *const OpenGL) void {
         },
 
         apprt.win32 => {
-            // Release the WGL context from the main thread so the
-            // renderer thread can make it current in threadEnter.
-            // The context was kept current since surfaceInit to allow
-            // Renderer.init() to create GL resources.
-            _ = wgl.wglMakeCurrent(null, null);
+            // Nothing to do. On Win32 this is only called during
+            // context-loss recovery on the renderer thread, after
+            // recreateGLContext + threadEnter already made the new
+            // context current. It must stay current for the GL calls
+            // the generic renderer makes right after this.
         },
 
         else => @compileError("only GTK should be calling displayRealized"),
     }
+}
+
+/// Called during context-loss recovery. The last presented target
+/// references a framebuffer from the lost context, so it must not
+/// be presented again.
+pub fn contextLost(self: *OpenGL) void {
+    self.last_target = null;
 }
 
 /// Actions taken before doing anything in `drawFrame`.

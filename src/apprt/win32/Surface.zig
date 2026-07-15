@@ -434,6 +434,28 @@ fn deinitGui(self: *Surface) void {
     log.debug("surface deinit: complete", .{});
 }
 
+/// Recreate the WGL context after GPU context loss (driver reset/TDR)
+/// and make it current. Renderer-thread only: the GUI thread touches
+/// hdc/hglrc only before the renderer thread spawns (init) and after
+/// it is joined (deinit), so there is no race. We do NOT re-run
+/// setupPixelFormat: SetPixelFormat is once-per-window and the
+/// CS_OWNDC device context keeps its format.
+pub fn recreateGLContext(self: *Surface) !void {
+    const hdc = self.hdc orelse return error.Win32Error;
+
+    // Create the new context before deleting the old one so a failure
+    // here leaves the old handle in place: the core surface deinit
+    // makes hglrc current on the GUI thread again after joining the
+    // renderer thread, so it must never be null.
+    const new = w32.wglCreateContext(hdc) orelse return error.Win32Error;
+
+    _ = w32.wglMakeCurrent(null, null);
+    if (self.hglrc) |old| _ = w32.wglDeleteContext(old);
+    self.hglrc = new;
+
+    if (w32.wglMakeCurrent(hdc, new) == 0) return error.Win32Error;
+}
+
 /// Set up a pixel format suitable for OpenGL rendering.
 fn setupPixelFormat(self: *Surface) !void {
     const pfd = w32.PIXELFORMATDESCRIPTOR{
