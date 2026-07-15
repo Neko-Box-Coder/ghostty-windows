@@ -168,6 +168,12 @@ palette_filtered: [palette_entries.len + MAX_USER_PALETTE_ENTRIES]u16 = undefine
 /// SplitTree.init() calls ref() to take initial ownership.
 ref_count: u32 = 0,
 
+/// Set when core_surface.deinit() timed out joining a wedged surface
+/// thread and leaked its state. The wedged thread can still reach this
+/// allocation (it embeds core_surface and the renderer thread struct),
+/// so it must never be freed.
+leaked: bool = false,
+
 /// SplitTree view protocol: increment reference count.
 pub fn ref(self: *Surface, alloc: Allocator) Allocator.Error!*Surface {
     _ = alloc;
@@ -181,7 +187,7 @@ pub fn unref(self: *Surface, alloc: Allocator) void {
     if (self.ref_count == 0) {
         if (self.hwnd) |h| _ = w32.ShowWindow(h, w32.SW_HIDE);
         self.deinit();
-        alloc.destroy(self);
+        if (!self.leaked) alloc.destroy(self);
     }
 }
 
@@ -329,6 +335,16 @@ pub fn deinit(self: *Surface) void {
 
         self.app.core_app.deleteSurface(self);
         log.debug("surface deinit: deleteSurface done", .{});
+
+        if (self.core_surface.deinit_leaked) {
+            // A wedged surface thread can still SetEvent the frame_event
+            // (signalFrameDrawn), use the WGL context, and SwapBuffers the
+            // DC, so leave all three alive alongside everything the core
+            // deinit leaked. GUI-only resources are still safe to destroy.
+            self.leaked = true;
+            self.deinitGui();
+            return;
+        }
     }
 
     if (self.frame_event) |event| {
@@ -355,6 +371,14 @@ pub fn deinit(self: *Surface) void {
     }
     log.debug("surface deinit: DC released", .{});
 
+    self.deinitGui();
+}
+
+/// Destroy resources only the GUI thread touches: the scrollbar, popup
+/// windows, GDI objects, and the GWLP_USERDATA back-pointer. Called on
+/// both the normal deinit path and the leak path (wedged surface thread),
+/// where everything the renderer/IO threads can reach must stay alive.
+fn deinitGui(self: *Surface) void {
     // Destroy the themed scrollbar before the surface HWND is gone.
     if (self.scrollbar) |sb| {
         sb.destroy();
