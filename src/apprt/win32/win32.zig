@@ -1432,6 +1432,16 @@ pub const WM_SETTINGCHANGE: u32 = 0x001A;
 pub const WM_SHOWWINDOW: u32 = 0x0018;
 
 // -----------------------------------------------------------------------
+// Power management broadcast
+// -----------------------------------------------------------------------
+
+pub const WM_POWERBROADCAST: u32 = 0x0218;
+// WM_POWERBROADCAST wParam values.
+pub const PBT_APMSUSPEND: usize = 0x0004;
+pub const PBT_APMRESUMESUSPEND: usize = 0x0007;
+pub const PBT_APMRESUMEAUTOMATIC: usize = 0x0012;
+
+// -----------------------------------------------------------------------
 // SetWindowCompositionAttribute — accent blur-behind for background-blur.
 // Undocumented but stable since Windows 10 (used by Windows Terminal et al).
 // -----------------------------------------------------------------------

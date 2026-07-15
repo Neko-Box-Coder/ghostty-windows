@@ -132,6 +132,16 @@ link_font: ?*anyopaque = null,
 search_total: ?usize = null,
 search_selected: ?usize = null,
 
+/// Last visibility state DELIVERED to the core occlusionCallback, so
+/// setVisible can drop redundant updates on the producer side. This must
+/// happen here: occlusionCallback pushes into the renderer mailbox with
+/// a bounded timeout, and the consumer-side dedupe in the renderer
+/// thread never runs while that mailbox is undrained, so repeated
+/// identical pushes (e.g. layoutSplits on every WM_SIZE of a resize
+/// drag) would stall the GUI thread and drop. Reset to null when
+/// delivery fails so the next call retries.
+last_reported_visible: ?bool = null,
+
 /// Command palette popup HWND.
 palette_hwnd: ?w32.HWND = null,
 /// Edit control inside the command palette popup.
@@ -497,8 +507,13 @@ pub fn getTitle(self: *const Surface) ?[:0]const u8 {
 /// Notify the core whether this surface is currently visible. When a surface
 /// is occluded (background tab, hidden split-zoom pane, minimized window) the
 /// renderer skips rebuilding/rendering frames until it is visible again
-/// (src/renderer/Thread.zig). The core mailbox dedupes redundant states, so
-/// re-asserting the same visibility (e.g. on every layout pass) is cheap.
+/// (src/renderer/Thread.zig). We must dedupe redundant states here on the
+/// producer side: the core pushes every call into the renderer mailbox with
+/// a bounded timeout, and the consumer-side dedupe in the renderer thread
+/// never runs while that mailbox is undrained, so unconditionally
+/// re-asserting the same visibility on every layout pass (one per WM_SIZE)
+/// would fill the queue and stall the GUI thread for the push timeout each,
+/// then drop.
 pub fn setVisible(self: *Surface, visible: bool) void {
     // Hide the hovered-URL bubble when this surface is occluded so a stale
     // preview doesn't float over the newly-active tab.
@@ -506,7 +521,14 @@ pub fn setVisible(self: *Surface, visible: bool) void {
         if (self.link_preview_hwnd) |h| _ = w32.ShowWindow(h, w32.SW_HIDE);
     }
     if (!self.core_surface_ready) return;
+    if (self.last_reported_visible == visible) return;
+    self.last_reported_visible = visible;
     self.core_surface.occlusionCallback(visible) catch |err| {
+        // Not delivered (mailbox full or wakeup failed): clear the
+        // latch so the next call retries instead of treating this
+        // state as sent — otherwise a dropped .visible=true could
+        // leave the renderer invisible forever.
+        self.last_reported_visible = null;
         log.warn("occlusionCallback failed err={}", .{err});
     };
 }

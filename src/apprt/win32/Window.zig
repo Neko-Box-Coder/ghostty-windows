@@ -439,7 +439,7 @@ pub fn addTab(self: *Window) !*Surface {
     // via ref(). If this fails, we manually clean up.
     var tree = SplitTree(Surface).init(alloc, surface) catch |err| {
         surface.deinit();
-        alloc.destroy(surface);
+        if (!surface.leaked) alloc.destroy(surface);
         return err;
     };
     errdefer tree.deinit(); // tree.deinit() calls unref() which deinits+frees surface
@@ -858,7 +858,7 @@ pub fn newSplit(self: *Window, direction: SplitTree(Surface).Split.Direction) !v
     const new_surface = try alloc.create(Surface);
     errdefer {
         new_surface.deinit();
-        alloc.destroy(new_surface);
+        if (!new_surface.leaked) alloc.destroy(new_surface);
     }
     try new_surface.init(self.app, self, .split);
 
@@ -1997,6 +1997,29 @@ pub fn windowWndProc(
             }
             window.handleResize();
             return 0;
+        },
+        w32.WM_POWERBROADCAST => {
+            // After system sleep/resume nothing else kicks a re-present:
+            // the renderer has no vsync/power awareness, so without this
+            // the last pre-sleep frame can stay on screen stale (the same
+            // bug as microsoft/terminal#14483). Invalidate every surface
+            // in the active tab; the surface WM_PAINT handler validates
+            // and wakes the renderer thread, driving a full re-present
+            // through the existing pipeline. Both resume events may
+            // arrive for a single resume; the redundant invalidation is
+            // harmless. Return TRUE per the message contract.
+            if (wparam == w32.PBT_APMRESUMEAUTOMATIC or
+                wparam == w32.PBT_APMRESUMESUSPEND)
+            {
+                if (window.active_tab < window.tab_count) {
+                    var it = window.tab_trees[window.active_tab].iterator();
+                    while (it.next()) |entry| {
+                        if (entry.view.hwnd) |h| _ = w32.InvalidateRect(h, null, 0);
+                    }
+                }
+                return 1;
+            }
+            return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
         w32.WM_MOVE => {
             // Top-level move: child surface HWNDs do NOT receive WM_MOVE
