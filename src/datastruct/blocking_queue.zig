@@ -102,7 +102,6 @@ pub fn BlockingQueue(
             self.mutex.lock();
             defer self.mutex.unlock();
 
-            // The
             if (self.full()) {
                 switch (timeout) {
                     // If we're not waiting, then we failed to write.
@@ -111,19 +110,29 @@ pub fn BlockingQueue(
                     .forever => {
                         self.not_full_waiters += 1;
                         defer self.not_full_waiters -= 1;
-                        self.cond_not_full.wait(&self.mutex);
+
+                        // Condition waits can wake up spuriously so we
+                        // must loop until there is actually space.
+                        while (self.full()) self.cond_not_full.wait(&self.mutex);
                     },
 
                     .ns => |ns| {
                         self.not_full_waiters += 1;
                         defer self.not_full_waiters -= 1;
-                        self.cond_not_full.timedWait(&self.mutex, ns) catch return 0;
+
+                        // Track total elapsed time across waits so that
+                        // spurious wakeups don't extend the timeout.
+                        var timer = std.time.Timer.start() catch return 0;
+                        while (self.full()) {
+                            const elapsed = timer.read();
+                            if (elapsed >= ns) return 0;
+                            self.cond_not_full.timedWait(
+                                &self.mutex,
+                                ns - elapsed,
+                            ) catch {};
+                        }
                     },
                 }
-
-                // If we're still full, then we failed to write. This can
-                // happen in situations where we are interrupted.
-                if (self.full()) return 0;
             }
 
             // Add our data and update our accounting
@@ -245,4 +254,70 @@ test "timed push" {
 
     // Timed push should fail
     try testing.expectEqual(@as(Q.Size, 0), q.push(2, .{ .ns = 1000 }));
+}
+
+test "timed push succeeds when a consumer frees space" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const Q = BlockingQueue(u64, 1);
+    const q = try Q.create(alloc);
+    defer q.destroy(alloc);
+
+    // Fill the queue so the timed push below has to wait.
+    try testing.expectEqual(@as(Q.Size, 1), q.push(1, .{ .instant = {} }));
+
+    // Pop from another thread while we block on the push.
+    const thr = try std.Thread.spawn(.{}, struct {
+        fn run(queue: *Q) void {
+            std.Thread.sleep(10 * std.time.ns_per_ms);
+            _ = queue.pop();
+        }
+    }.run, .{q});
+    defer thr.join();
+
+    // Generous timeout so this can't flake under load.
+    try testing.expectEqual(
+        @as(Q.Size, 1),
+        q.push(2, .{ .ns = 30 * std.time.ns_per_s }),
+    );
+}
+
+test "forever push survives spurious wakeups" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const Q = BlockingQueue(u64, 1);
+    const q = try Q.create(alloc);
+    defer q.destroy(alloc);
+
+    // Fill the queue so the push below blocks.
+    try testing.expectEqual(@as(Q.Size, 1), q.push(1, .{ .instant = {} }));
+
+    const thr = try std.Thread.spawn(.{}, struct {
+        fn run(queue: *Q) void {
+            _ = queue.push(2, .{ .forever = {} });
+        }
+    }.run, .{q});
+
+    // Wait until the pusher is blocked on the condition variable. If we
+    // hold the mutex and see a waiter then the pusher has released the
+    // mutex inside the condition wait.
+    while (true) {
+        q.mutex.lock();
+        const waiting = q.not_full_waiters == 1;
+        q.mutex.unlock();
+        if (waiting) break;
+        std.Thread.sleep(std.time.ns_per_ms);
+    }
+
+    // Wake the pusher without making space. This mimics a spurious
+    // wakeup: the push must keep waiting rather than drop the value.
+    q.cond_not_full.signal();
+    std.Thread.sleep(10 * std.time.ns_per_ms);
+
+    // Make space; the blocked push must complete with our value.
+    try testing.expect(q.pop().? == 1);
+    thr.join();
+    try testing.expect(q.pop().? == 2);
 }
