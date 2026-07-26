@@ -753,6 +753,11 @@ pub extern "user32" fn FillRect(
 // Clipboard format: Unicode text (UTF-16LE, null-terminated)
 pub const CF_UNICODETEXT: u32 = 13;
 
+// Clipboard format: a DROPFILES struct + path list, the same payload
+// WM_DROPFILES delivers. This is what Explorer puts on the clipboard when
+// you copy files, and it can be read with DragQueryFileW.
+pub const CF_HDROP: u32 = 15;
+
 // GlobalAlloc flags
 pub const GMEM_MOVEABLE: u32 = 0x0002;
 

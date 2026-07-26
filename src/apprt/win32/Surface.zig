@@ -660,6 +660,28 @@ pub fn clipboardRequest(
         }
         defer _ = w32.CloseClipboard();
 
+        // Files copied in Explorer land on the clipboard as CF_HDROP with no
+        // text format at all, so a plain CF_UNICODETEXT read pastes nothing.
+        // Paste them as space-separated, quoted paths — the same rendering
+        // WM_DROPFILES already produces, and the parity match for macOS,
+        // which pastes shell-escaped paths for file pasteboards.
+        //
+        // CF_HDROP wins when a source offers both formats: its text is
+        // normally the same paths unquoted, and the quoted form is the one
+        // that actually works when the paste lands on a shell command line.
+        if (w32.GetClipboardData(w32.CF_HDROP)) |hdrop_handle| hdrop: {
+            // Pass the handle straight to DragQueryFileW, which locks it
+            // internally — exactly as handleDropFiles does with the HDROP
+            // from WM_DROPFILES. Do NOT GlobalLock and pass the resulting
+            // pointer: clipboard data is moveable, so the handle and the
+            // locked address are different values. And never DragFinish it;
+            // the clipboard owns this handle, not us.
+            const paths = (try hdropPathsToUtf8(alloc, @ptrCast(hdrop_handle))) orelse
+                break :hdrop;
+            defer alloc.free(paths);
+            break :blk try alloc.dupeZ(u8, paths);
+        }
+
         const hglobal = w32.GetClipboardData(w32.CF_UNICODETEXT) orelse return false;
         const ptr16 = w32.GlobalLock(hglobal) orelse {
             log.warn("GlobalLock failed", .{});
@@ -2279,38 +2301,12 @@ pub fn handleDropFiles(self: *Surface, wparam: usize) void {
     const hdrop: w32.HDROP = @ptrFromInt(wparam);
     defer w32.DragFinish(hdrop);
 
-    // Number of files dropped (passing 0xFFFFFFFF as iFile).
-    const count = w32.DragQueryFileW(hdrop, 0xFFFFFFFF, null, 0);
-    if (count == 0) return;
-
     const alloc = self.app.core_app.alloc;
-    var buf: std.ArrayListUnmanaged(u8) = .empty;
-    defer buf.deinit(alloc);
-
-    var i: u32 = 0;
-    while (i < count) : (i += 1) {
-        // First call with NULL gets length (in chars, excluding NUL).
-        const u16_len = w32.DragQueryFileW(hdrop, i, null, 0);
-        if (u16_len == 0) continue;
-        const u16_buf = alloc.alloc(u16, u16_len + 1) catch return;
-        defer alloc.free(u16_buf);
-        const got = w32.DragQueryFileW(hdrop, i, u16_buf.ptr, @intCast(u16_buf.len));
-        if (got == 0) continue;
-
-        // UTF-16 → UTF-8.
-        const utf8_buf = alloc.alloc(u8, u16_buf.len * 4) catch return;
-        defer alloc.free(utf8_buf);
-        const utf8_len = std.unicode.utf16LeToUtf8(utf8_buf, u16_buf[0..got]) catch continue;
-        const path = utf8_buf[0..utf8_len];
-
-        if (i > 0) buf.append(alloc, ' ') catch return;
-        const needs_quote = std.mem.indexOfAny(u8, path, " \t") != null;
-        if (needs_quote) buf.append(alloc, '"') catch return;
-        buf.appendSlice(alloc, path) catch return;
-        if (needs_quote) buf.append(alloc, '"') catch return;
-    }
-
-    if (buf.items.len == 0) return;
+    const text = (hdropPathsToUtf8(alloc, hdrop) catch |err| {
+        log.err("drop-files path conversion: {}", .{err});
+        return;
+    }) orelse return;
+    defer alloc.free(text);
 
     // Send through keyCallback as text so it goes through the same
     // path as IME/clipboard input (PTY-bound, encoding-correct).
@@ -2320,11 +2316,81 @@ pub fn handleDropFiles(self: *Surface, wparam: usize) void {
         .mods = .{},
         .consumed_mods = .{},
         .composing = false,
-        .utf8 = buf.items,
+        .utf8 = text,
         .unshifted_codepoint = 0,
     }) catch |err| {
         log.err("drop-files keyCallback: {}", .{err});
     };
+}
+
+/// Convert the path list in an HDROP into one shell-ready UTF-8 string:
+/// each path double-quoted, joined with single spaces.
+///
+/// Used by both WM_DROPFILES and CF_HDROP clipboard pastes. The caller owns
+/// the returned slice; this function never releases the HDROP. A
+/// WM_DROPFILES handle must be DragFinish'd by the caller. A clipboard
+/// handle from GetClipboardData(CF_HDROP) must NOT be freed, DragFinish'd,
+/// or unlocked — the clipboard owns it, and DragQueryFileW takes and drops
+/// its own lock internally, so the caller neither locks nor unlocks it.
+/// Returns null when there is nothing usable.
+fn hdropPathsToUtf8(alloc: Allocator, hdrop: w32.HDROP) Allocator.Error!?[]u8 {
+    // Number of files (passing 0xFFFFFFFF as iFile).
+    const count = w32.DragQueryFileW(hdrop, 0xFFFFFFFF, null, 0);
+    if (count == 0) return null;
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(alloc);
+
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        // First call with NULL gets length (in chars, excluding NUL).
+        const u16_len = w32.DragQueryFileW(hdrop, i, null, 0);
+        if (u16_len == 0) continue;
+        const u16_buf = try alloc.alloc(u16, u16_len + 1);
+        defer alloc.free(u16_buf);
+        const got = w32.DragQueryFileW(hdrop, i, u16_buf.ptr, @intCast(u16_buf.len));
+        if (got == 0) continue;
+
+        // UTF-16 → UTF-8.
+        const utf8_buf = try alloc.alloc(u8, u16_buf.len * 4);
+        defer alloc.free(utf8_buf);
+        const utf8_len = std.unicode.utf16LeToUtf8(utf8_buf, u16_buf[0..got]) catch continue;
+        const path = utf8_buf[0..utf8_len];
+
+        // A double quote can't occur in a path created through the Win32
+        // API, but volumes written by WSL, Samba/NFS, or via \\?\ paths can
+        // carry one. It would close the wrapper below and let the rest of
+        // the name — and the quoting of every path after it — be read as
+        // shell syntax, so refuse to emit such a path at all. Logged
+        // without the name: it can also hold control characters.
+        if (std.mem.indexOfScalar(u8, path, '"') != null) {
+            log.warn("refusing to paste a path containing a double quote", .{});
+            continue;
+        }
+
+        // Quote unconditionally, not just for whitespace. Windows filenames
+        // may legally contain & | ( ) ; ^ < > and glob characters, and
+        // wrapping neutralizes those in cmd.exe, PowerShell and POSIX
+        // shells alike. Residual, and not fixable without knowing which
+        // shell is on the other end: $(...) and backticks still expand
+        // inside double quotes under bash/zsh/PowerShell, as does %VAR%
+        // under cmd.exe. The core unsafe-paste check does not cover these
+        // (input/paste.zig isSafe only looks for \n and \x1b[201~), but
+        // pasting never submits a line on its own.
+        //
+        // Separate from whatever we already appended rather than keying off
+        // `i`, so a skipped entry can't leave a leading or doubled space.
+        if (buf.items.len > 0) try buf.append(alloc, ' ');
+        try buf.append(alloc, '"');
+        try buf.appendSlice(alloc, path);
+        try buf.append(alloc, '"');
+    }
+
+    if (buf.items.len == 0) {
+        buf.deinit(alloc);
+        return null;
+    }
+    return try buf.toOwnedSlice(alloc);
 }
 
 /// Handle WM_MOUSEWHEEL (vertical) and WM_MOUSEHWHEEL (horizontal).
