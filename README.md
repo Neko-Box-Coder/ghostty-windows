@@ -113,7 +113,7 @@ synced with upstream main. The terminal is ready for daily use.
 
 ## Building
 
-Requires [Zig](https://ziglang.org/download/) 0.15.2 or newer.
+Requires [Zig](https://ziglang.org/download/) 0.16.0.
 
 ### Native build on Windows (recommended)
 
@@ -140,10 +140,24 @@ but still allows it to be renamed.
 The same command works from Linux with the GNU ABI target
 (`x86_64-windows-gnu` — the plain `x86_64-windows` target selects the MSVC
 ABI, which cannot cross-compile from Linux because it lacks the MSVC
-headers). Note that on some WSL setups the final exe link step fails with
-`AccessDenied`; if that happens, build with the native Windows Zig instead
-(e.g. from WSL interop: copy the source to an NTFS path and run
-`zig.exe build …` there).
+headers).
+
+On WSL, drop the Windows entries from `PATH` before building:
+
+```bash
+export PATH=$(echo "$PATH" | tr ':' '\n' | grep -v '^/mnt/c' | paste -sd:)
+```
+
+WSL appends the Windows `PATH` by default, and one of its entries
+(`/mnt/c/Windows/system32/config/systemprofile/AppData/Local/Microsoft/WindowsApps`)
+is unreadable from Linux. Zig probes `PATH` for a system `cc` and reports
+the resulting `EACCES` as a bare `error: AccessDenied` with no indication
+of which file it came from. With the Windows entries removed, the full
+`ghostty.exe` cross-links and `zig build test -Dapp-runtime=win32` runs the
+test suite through WSL interop.
+
+One test, `Command: custom env vars`, fails under WSL interop because it
+spawns `cmd.exe` with a minimal environment block; it passes on Windows CI.
 
 ### Release build
 

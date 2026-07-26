@@ -10,6 +10,7 @@ const Config = configpkg.Config;
 const CoreApp = @import("../../App.zig");
 const CoreSurface = @import("../../Surface.zig");
 const internal_os = @import("../../os/main.zig");
+const global = @import("../../global.zig");
 
 const QuickTerminal = @import("QuickTerminal.zig");
 const Surface = @import("Surface.zig");
@@ -1617,30 +1618,26 @@ fn startUpdateCheck(self: *App) void {
 /// the way out so a successful return throttles the next call.
 fn shouldRunUpdateCheck(self: *App) bool {
     const alloc = self.core_app.alloc;
-    const dir = std.process.getEnvVarOwned(alloc, "LOCALAPPDATA") catch return true;
+    const io = global.io();
+    const dir = global.environ().getAlloc(alloc, "LOCALAPPDATA") catch return true;
     defer alloc.free(dir);
     const path = std.fs.path.join(alloc, &.{ dir, "ghostty", "update_check_at" }) catch return true;
     defer alloc.free(path);
 
-    const now = std.time.timestamp();
-    if (std.fs.cwd().openFile(path, .{})) |f| {
-        defer f.close();
-        var buf: [32]u8 = undefined;
-        const n = f.readAll(&buf) catch 0;
-        const text = std.mem.trim(u8, buf[0..n], " \t\r\n");
+    const now = std.Io.Clock.now(.real, io).toSeconds();
+    if (std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(32))) |contents| {
+        defer alloc.free(contents);
+        const text = std.mem.trim(u8, contents, " \t\r\n");
         if (std.fmt.parseInt(i64, text, 10)) |last| {
             if (now - last < UPDATE_CHECK_INTERVAL_SECS) return false;
         } else |_| {}
     } else |_| {}
 
     // Write (or create) the file with the current timestamp.
-    if (std.fs.cwd().makePath(std.fs.path.dirname(path) orelse return true)) |_| {} else |_| {}
-    if (std.fs.cwd().createFile(path, .{ .truncate = true })) |f| {
-        defer f.close();
-        var ts_buf: [32]u8 = undefined;
-        const s = std.fmt.bufPrint(&ts_buf, "{d}", .{now}) catch return true;
-        f.writeAll(s) catch {};
-    } else |_| {}
+    std.Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(path) orelse return true) catch {};
+    var ts_buf: [32]u8 = undefined;
+    const s = std.fmt.bufPrint(&ts_buf, "{d}", .{now}) catch return true;
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = s }) catch {};
     return true;
 }
 

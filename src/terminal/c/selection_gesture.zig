@@ -241,7 +241,7 @@ pub fn event_new(
     event_type: EventType,
 ) callconv(lib.calling_conv) Result {
     const out = out_event orelse return .invalid_value;
-    _ = std.meta.intToEnum(EventType, @intFromEnum(event_type)) catch
+    _ = std.enums.fromInt(EventType, @intFromEnum(event_type)) orelse
         return .invalid_value;
 
     const alloc = lib.alloc.default(alloc_);
@@ -343,7 +343,7 @@ pub fn event_set(
     value: ?*const anyopaque,
 ) callconv(lib.calling_conv) Result {
     if (comptime std.debug.runtime_safety) {
-        _ = std.meta.intToEnum(EventOption, @intFromEnum(option)) catch {
+        _ = std.enums.fromInt(EventOption, @intFromEnum(option)) orelse {
             log.warn("selection_gesture_event_set invalid option value={d}", .{@intFromEnum(option)});
             return .invalid_value;
         };
@@ -365,7 +365,7 @@ pub fn get(
     out: ?*anyopaque,
 ) callconv(lib.calling_conv) Result {
     if (comptime std.debug.runtime_safety) {
-        _ = std.meta.intToEnum(Data, @intFromEnum(data)) catch {
+        _ = std.enums.fromInt(Data, @intFromEnum(data)) orelse {
             log.warn("selection_gesture_get invalid data value={d}", .{@intFromEnum(data)});
             return .invalid_value;
         };
@@ -738,57 +738,25 @@ fn clearWordBoundaryCodepoints(event: *EventWrapper, target: *[]const u21) void 
     target.* = &selection_codepoints.default_word_boundaries;
 }
 
-fn instantFromNs(ns: u64) SelectionGesture.Time {
-    if (comptime builtin.target.cpu.arch == .wasm32 and
-        builtin.target.os.tag == .freestanding)
-    {
-        return ns;
-    }
-
-    return switch (builtin.os.tag) {
-        // Windows local fix (not upstreamed): std.time.Instant.timestamp holds
-        // QueryPerformanceCounter ticks here, not nanoseconds, and
-        // Instant.since() rescales the tick delta by ns_per_s/QPF. Upstream
-        // groups Windows with uefi/wasi and stores the raw C-API nanosecond
-        // value as .timestamp, so timeSince() then multiplies it by ns_per_s/QPF
-        // and returns garbage — breaking double/triple-click repeat detection
-        // for libghostty-vt consumers on Windows. Convert ns to QPC ticks
-        // (ticks = ns * QPF / ns_per_s) so timeSince() reads back correct
-        // nanoseconds. uefi/wasi keep raw ns because their Instant.timestamp
-        // *is* nanoseconds.
-        .windows => .{ .timestamp = @intCast(
-            @as(u128, ns) * std.os.windows.QueryPerformanceFrequency() / std.time.ns_per_s,
-        ) },
-        .uefi, .wasi => .{ .timestamp = ns },
-        else => .{ .timestamp = .{
-            .sec = @intCast(ns / std.time.ns_per_s),
-            .nsec = @intCast(ns % std.time.ns_per_s),
-        } },
-    };
+fn instantFromNs(ns: u64) std.Io.Timestamp {
+    return .fromNanoseconds(ns);
 }
 
 fn validBehavior(behavior: Behavior) bool {
-    _ = std.meta.intToEnum(Behavior, @intFromEnum(behavior)) catch return false;
+    _ = std.enums.fromInt(Behavior, @intFromEnum(behavior)) orelse return false;
     return true;
 }
 
 test "instantFromNs: timeSince round-trips nanoseconds" {
-    // Skip on freestanding wasm, where Time is a raw u64 nanosecond value and
-    // there is no std.time.Instant.since to exercise.
-    if (comptime builtin.target.cpu.arch == .wasm32 and
-        builtin.target.os.tag == .freestanding) return error.SkipZigTest;
-
-    // Two C-API nanosecond timestamps 200 ms apart. Converting each through
-    // instantFromNs and measuring with Instant.since must recover ~200 ms; the
-    // Windows path additionally round-trips through QPC ticks. Guards against
-    // regressing to the upstream grouping that stores Windows timestamps as raw
-    // nanoseconds, which makes since() return a QPF-rescaled (wrong) value and
-    // breaks double/triple-click repeat detection for libghostty-vt consumers.
+    // Two C-API nanosecond timestamps 200 ms apart must measure as exactly
+    // 200 ms via the same durationTo path SelectionGesture.timeSince uses.
+    // Historically this guarded a Windows-only bug where std.time.Instant
+    // stored QPC ticks and repeat detection broke for libghostty-vt
+    // consumers; std.Io.Timestamp is plain nanoseconds on all platforms.
     const start = instantFromNs(500_000_000);
     const end = instantFromNs(700_000_000);
-    const elapsed_ns = end.since(start);
-    try testing.expect(elapsed_ns >= 199_000_000);
-    try testing.expect(elapsed_ns <= 201_000_000);
+    const elapsed_ns = start.durationTo(end).toNanoseconds();
+    try testing.expectEqual(@as(i64, 200_000_000), elapsed_ns);
 }
 
 test "selection gesture lifecycle and get" {

@@ -1473,7 +1473,8 @@ pub extern "user32" fn SetWindowCompositionAttribute(
 // -----------------------------------------------------------------------
 
 pub const GUID = std.os.windows.GUID;
-pub const HRESULT = std.os.windows.HRESULT;
+// Zig 0.16 removed HRESULT from std.os.windows.
+pub const HRESULT = c_long;
 pub const BOOL = std.os.windows.BOOL;
 
 pub const CLSCTX_INPROC_SERVER: u32 = 0x1;

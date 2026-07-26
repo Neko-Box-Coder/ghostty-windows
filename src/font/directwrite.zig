@@ -9,11 +9,13 @@
 const std = @import("std");
 const windows = std.os.windows;
 
-pub const HRESULT = windows.HRESULT;
+// Zig 0.16 removed HRESULT from std.os.windows and made BOOL a typed
+// enum wrapper; keep COM-ABI-compatible definitions here.
+pub const HRESULT = c_long;
 pub const S_OK: HRESULT = 0;
 pub const BOOL = windows.BOOL;
-pub const TRUE: BOOL = 1;
-pub const FALSE: BOOL = 0;
+pub const TRUE: BOOL = BOOL.TRUE;
+pub const FALSE: BOOL = .FALSE;
 pub const GUID = windows.GUID;
 
 const PadFn = *const fn () callconv(.c) void;

@@ -11,6 +11,7 @@ const terminal = @import("../../terminal/main.zig");
 const termio = @import("../../termio.zig");
 const CoreSurface = @import("../../Surface.zig");
 const internal_os = @import("../../os/main.zig");
+const global = @import("../../global.zig");
 
 const App = @import("App.zig");
 const Window = @import("Window.zig");
@@ -800,10 +801,9 @@ pub fn setClipboard(
     }
 }
 
-pub fn defaultTermioEnv(self: *const Surface) !std.process.EnvMap {
-    const alloc = self.app.core_app.alloc;
-    var env = try internal_os.getEnvMap(alloc);
-    errdefer env.deinit();
+pub fn defaultTermioEnv(self: *const Surface) !std.process.Environ.Map {
+    _ = self;
+    const env = try global.environMap();
 
     // TERM and COLORTERM are set by termio/Exec.zig with platform-aware
     // logic (checking for terminfo, resources_dir, etc.). Do not set them here.
@@ -2529,8 +2529,8 @@ fn positionImeWindow(self: *Surface) void {
 /// via \x1b[?9001h and causes key events to be sent as
 /// \x1b[Vk;Sc;Uc;Kd;Cs;Rc_ sequences.
 pub fn isWin32InputMode(self: *Surface) bool {
-    self.core_surface.renderer_state.mutex.lock();
-    defer self.core_surface.renderer_state.mutex.unlock();
+    self.core_surface.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.core_surface.renderer_state.mutex.unlock(global.io());
     return self.core_surface.io.terminal.modes.get(.win32_input);
 }
 

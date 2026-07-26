@@ -9,11 +9,13 @@
 .flatpak-builder/
 zig-cache/
 .zig-cache/
+zig-pkg/
 zig-out/
+zig-pkg/
 build-cmake/
 CMakeCache.txt
 CMakeFiles/
-/build.zig.zon.bak
+build.zig.zon.bak
 /result*
 /.nixos-test-history
 example/*.wasm
@@ -34,5 +36,4 @@ dist/windows/ghostty-windows-x64-*.zip
 # Claude Code session state (local only)
 .claude/
 
-# Zig 0.16+ package cache (lands here when build deps resolve outside .zig-cache)
-zig-pkg/
+/sprite_face_test*

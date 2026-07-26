@@ -12,6 +12,7 @@ const Face = @import("main.zig").Face;
 const Library = @import("main.zig").Library;
 const Presentation = @import("main.zig").Presentation;
 const Variation = @import("main.zig").face.Variation;
+const global = @import("../global.zig");
 
 const log = std.log.scoped(.discovery);
 
@@ -1253,15 +1254,15 @@ pub const Windows = struct {
         desc: Descriptor,
         variations: []const Variation,
         state: State,
-        dir: ?std.fs.Dir,
-        iter: ?std.fs.Dir.Iterator,
+        dir: ?std.Io.Dir,
+        iter: ?std.Io.Dir.Iterator,
         system_path: ?[:0]const u8,
         user_path: ?[:0]const u8,
 
         const State = enum { system, user, done };
 
         pub fn deinit(self: *DiscoverIterator) void {
-            if (self.dir) |*d| d.close();
+            if (self.dir) |*d| d.close(global.io());
             if (self.system_path) |p| self.alloc.free(p);
             if (self.user_path) |p| self.alloc.free(p);
             self.* = undefined;
@@ -1278,7 +1279,8 @@ pub const Windows = struct {
                                 continue;
                             };
                             self.system_path = path;
-                            self.dir = std.fs.openDirAbsoluteZ(
+                            self.dir = std.Io.Dir.openDirAbsolute(
+                                global.io(),
                                 path,
                                 .{ .iterate = true },
                             ) catch {
@@ -1293,7 +1295,8 @@ pub const Windows = struct {
                                 continue;
                             };
                             self.user_path = path;
-                            self.dir = std.fs.openDirAbsoluteZ(
+                            self.dir = std.Io.Dir.openDirAbsolute(
+                                global.io(),
                                 path,
                                 .{ .iterate = true },
                             ) catch {
@@ -1306,9 +1309,9 @@ pub const Windows = struct {
                     }
                 }
 
-                const entry = (self.iter.?.next() catch null) orelse {
+                const entry = (self.iter.?.next(global.io()) catch null) orelse {
                     // Finished this directory; advance state.
-                    if (self.dir) |*d| d.close();
+                    if (self.dir) |*d| d.close(global.io());
                     self.dir = null;
                     self.iter = null;
                     self.state = switch (self.state) {
@@ -1331,7 +1334,7 @@ pub const Windows = struct {
         /// Windows install but we just skip the directory rather than
         /// falling back to a hardcoded drive letter.
         fn systemFontsPath(self: *DiscoverIterator) ?[:0]const u8 {
-            const systemroot = std.process.getEnvVarOwned(
+            const systemroot = global.environ().getAlloc(
                 self.alloc,
                 "SYSTEMROOT",
             ) catch return null;
@@ -1345,7 +1348,7 @@ pub const Windows = struct {
         }
 
         fn userFontsPath(self: *DiscoverIterator) ?[:0]const u8 {
-            const local_appdata = std.process.getEnvVarOwned(
+            const local_appdata = global.environ().getAlloc(
                 self.alloc,
                 "LOCALAPPDATA",
             ) catch return null;
