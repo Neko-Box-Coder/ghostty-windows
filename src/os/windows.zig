@@ -13,6 +13,7 @@ pub const GetCurrentProcessId = windows.GetCurrentProcessId;
 pub const GetLastError = windows.GetLastError;
 pub const unexpectedError = windows.unexpectedError;
 pub const unexpectedStatus = windows.unexpectedStatus;
+pub const CloseHandle = windows.CloseHandle;
 
 // Primitive types
 pub const BOOL = windows.BOOL;
@@ -73,6 +74,7 @@ pub const TRUE: windows.BOOL = .fromBool(true);
 
 // Bit-field and enum constant values
 pub const CREATE_UNICODE_ENVIRONMENT = 0x00000400;
+pub const CREATE_SUSPENDED = 0x00000004;
 pub const EXTENDED_STARTUPINFO_PRESENT = 0x00080000;
 pub const FILE_ATTRIBUTE_NORMAL = 0x80;
 pub const FILE_FLAG_FIRST_PIPE_INSTANCE = 0x00080000;
@@ -93,6 +95,8 @@ pub const PROC_THREAD_ATTRIBUTE_INPUT = 0x00020000;
 pub const PROC_THREAD_ATTRIBUTE_NUMBER = 0x0000FFFF;
 pub const PROC_THREAD_ATTRIBUTE_THREAD = 0x00010000;
 pub const S_OK = 0;
+pub const STATUS_PENDING = 0x00000103;
+pub const STILL_ACTIVE = STATUS_PENDING;
 pub const WAIT_FAILED = 0xFFFFFFFF;
 
 pub const PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE = ProcThreadAttributeValue(
@@ -107,6 +111,44 @@ pub const ACCESS_MASK = windows.ACCESS_MASK;
 pub const IO_STATUS_BLOCK = windows.IO_STATUS_BLOCK;
 pub const NTSTATUS = windows.NTSTATUS;
 pub const OBJECT_ATTRIBUTES = windows.OBJECT.ATTRIBUTES;
+
+pub const KnownFolderPathError = error{
+    BufferTooSmall,
+};
+
+extern "shell32" fn SHGetKnownFolderPath(
+    rfid: *const windows.KNOWNFOLDERID,
+    dwFlags: windows.DWORD,
+    hToken: ?windows.HANDLE,
+    ppszPath: *?windows.PWSTR,
+) callconv(.winapi) windows.HRESULT;
+extern "ole32" fn CoTaskMemFree(pv: ?*anyopaque) callconv(.winapi) void;
+
+// pub fn knownFolderPathUtf8(
+//     folder_id: *const windows.KNOWNFOLDERID,
+//     buf: []u8,
+// ) KnownFolderPathError!?[]const u8 {
+//     var path_w: ?windows.PWSTR = null;
+//     const hr = SHGetKnownFolderPath(
+//         folder_id,
+//         windows.KF_FLAG_DONT_VERIFY,
+//         null,
+//         &path_w,
+//     );
+//     if (hr != windows.S_OK) return null;
+// 
+//     const w = path_w orelse return null;
+//     defer CoTaskMemFree(w);
+// 
+//     const slice_w = std.mem.sliceTo(w, 0);
+//     if (slice_w.len * 3 > buf.len) return error.BufferTooSmall;
+// 
+//     const len = std.unicode.utf16LeToUtf8(buf, slice_w) catch {
+//         return null;
+//     };
+// 
+//     return buf[0..len];
+// }
 
 // Exported functions by library
 pub const exp = struct {
@@ -158,6 +200,9 @@ pub const exp = struct {
             lpTotalBytesAvail: ?*DWORD,
             lpBytesLeftThisMessage: ?*DWORD,
         ) callconv(.winapi) BOOL;
+        pub extern "kernel32" fn ResumeThread(
+            hThread: windows.HANDLE,
+        ) callconv(.winapi) windows.DWORD;
         // Duplicated here because lpCommandLine is not marked optional in zig std
         pub extern "kernel32" fn CreateProcessW(
             lpApplicationName: ?LPWSTR,

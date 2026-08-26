@@ -35,6 +35,7 @@ const Allocator = std.mem.Allocator;
 const File = std.Io.File;
 const EnvMap = std.process.Environ.Map;
 const apprt = @import("apprt.zig");
+const log = std.log.scoped(.command);
 
 /// Function prototype for a function executed /in the child process/ after the
 /// fork, but before exec'ing the command. If the function returns a u8, the
@@ -108,8 +109,15 @@ pseudo_console: if (builtin.os.tag == .windows) ?windows.HPCON else void =
 /// for a more user-friendly API.
 data: ?*anyopaque = null,
 
-/// Process ID (POSIX) or process handle (Windows), set after start is called.
-pid: if (builtin.os.tag == .windows) ?windows.HANDLE else ?posix.system.pid_t = null,
+/// Process ID is set after start is called.
+pid: ?posix.pid_t = null,
+
+/// Optional Windows Job Object plan and live handle. Inert on non-Windows
+/// builds.
+windows_job_object_plan: if (builtin.os.tag == .windows) apprt.win32_job_object.Plan else void =
+    if (builtin.os.tag == .windows) .{ .mode = .never } else {},
+windows_job_object_handle: if (builtin.os.tag == .windows) ?windows.HANDLE else void =
+    if (builtin.os.tag == .windows) null else {},
 
 /// The various methods a process may exit.
 pub const Exit = if (builtin.os.tag == .windows) union(enum) {
@@ -303,20 +311,17 @@ fn fork() !posix.pid_t {
 }
 
 fn startWindows(self: *Command, arena: Allocator) !void {
-    const cwd_w = if (self.cwd) |cwd| try std.unicode.utf8ToUtf16LeAllocZ(arena, cwd) else null;
-
-    // Pass null for lpApplicationName and put the program as the first
-    // token of lpCommandLine. This lets CreateProcessW perform the
-    // standard program search (parent-app dir, CWD, system dirs, PATH)
-    // and append ".exe" when the name has no extension, which is what
-    // users expect for bare commands like `wsl ~` or `pwsh.exe`.
-    // It also preserves the child's argv[0] as written by the caller
-    // rather than replacing it with the resolved absolute path.
-    const command_line = if (self.args.len > 0)
-        try windowsCreateCommandLine(arena, self.args)
+    const application_w = try std.unicode.utf8ToUtf16LeAllocZ(arena, self.path);
+    const application_name_w: ?[*:0]u16 = if (windowsShouldSearchPath(self.path))
+        null
     else
-        try windowsCreateCommandLine(arena, &.{self.path});
-    const command_line_w = try std.unicode.utf8ToUtf16LeAllocZ(arena, command_line);
+        application_w.ptr;
+    const cwd = try safeWindowsCurrentDirectory(arena, self.path, self.cwd);
+    const cwd_w = if (cwd) |v| try std.unicode.utf8ToUtf16LeAllocZ(arena, v) else null;
+    const command_line_w = if (self.args.len > 0) b: {
+        const command_line = try windowsCreateCommandLine(arena, self.args);
+        break :b try std.unicode.utf8ToUtf16LeAllocZ(arena, command_line);
+    } else null;
     const env_w = if (self.env) |env_map| try createWindowsEnvBlock(arena, env_map) else null;
 
     const any_null_fd = self.stdin == null or self.stdout == null or self.stderr == null;
@@ -415,13 +420,19 @@ fn startWindows(self: *Command, arena: Allocator) !void {
         .lpAttributeList = attribute_list,
     };
 
+    var job_handle = try self.createWindowsJobObjectForLaunch();
+    errdefer {
+        if (job_handle) |handle| _ = windows.CloseHandle(handle);
+    }
+
     var flags: windows.DWORD = windows.CREATE_UNICODE_ENVIRONMENT;
     if (attribute_list != null) flags |= windows.EXTENDED_STARTUPINFO_PRESENT;
+    if (job_handle != null) flags |= windows.CREATE_SUSPENDED;
 
     var process_information: windows.PROCESS_INFORMATION = undefined;
     if (windows.exp.kernel32.CreateProcessW(
-        null,
-        command_line_w.ptr,
+        application_name_w,
+        if (command_line_w) |w| w.ptr else null,
         null,
         null,
         windows.TRUE,
@@ -431,8 +442,166 @@ fn startWindows(self: *Command, arena: Allocator) !void {
         @ptrCast(&startup_info_ex.StartupInfo),
         &process_information,
     ) == windows.FALSE) return windows.unexpectedError(windows.GetLastError());
+    errdefer {
+        _ = windows.exp.kernel32.TerminateProcess(process_information.hProcess, 1);
+        _ = windows.CloseHandle(process_information.hThread);
+        _ = windows.CloseHandle(process_information.hProcess);
+    }
+
+    if (job_handle) |handle| {
+        if (apprt.win32_job_object.AssignProcessToJobObject(handle, process_information.hProcess) == windows.FALSE) {
+            const last_error = windows.GetLastError();
+            if (self.windows_job_object_plan.attach_policy == .hard_fail) {
+                return windows.unexpectedError(last_error);
+            }
+
+            log.warn("windows job object attach failed; continuing without limits err={}", .{last_error});
+            _ = windows.CloseHandle(handle);
+            job_handle = null;
+
+            var exit_code: windows.DWORD = undefined;
+            if (windows.exp.kernel32.GetExitCodeProcess(process_information.hProcess, &exit_code) == windows.FALSE) {
+                return windows.unexpectedError(windows.GetLastError());
+            }
+            if (exit_code != windows.STILL_ACTIVE) {
+                return error.WindowsJobObjectAttachExitedChild;
+            }
+        }
+
+        if (windows.exp.kernel32.ResumeThread(process_information.hThread) == std.math.maxInt(windows.DWORD)) {
+            return windows.unexpectedError(windows.GetLastError());
+        }
+    }
+
+    _ = windows.CloseHandle(process_information.hThread);
 
     self.pid = process_information.hProcess;
+    self.windows_job_object_handle = job_handle;
+}
+
+fn createWindowsJobObjectForLaunch(self: *Command) !?windows.HANDLE {
+    const plan = self.windows_job_object_plan;
+    switch (apprt.win32_job_object.attachTarget(plan, self.path)) {
+        .disabled => return null,
+        .unsupported_wsl => {
+            if (plan.attach_policy == .hard_fail) return error.UnsupportedJobObjectTarget;
+            log.warn("windows job object limits are not applied to WSL launches path={s}", .{self.path});
+            return null;
+        },
+        .attach => {},
+    }
+
+    const handle = apprt.win32_job_object.CreateJobObjectW(null, null) orelse {
+        const last_error = windows.GetLastError();
+        if (plan.attach_policy == .hard_fail) return windows.unexpectedError(last_error);
+        log.warn("windows job object creation failed; continuing without limits err={}", .{last_error});
+        return null;
+    };
+    errdefer _ = windows.CloseHandle(handle);
+
+    if (plan.extendedLimitInformation()) |limits| {
+        if (apprt.win32_job_object.SetInformationJobObject(
+            handle,
+            .extended_limit_information,
+            &limits,
+            @sizeOf(apprt.win32_job_object.JOBOBJECT_EXTENDED_LIMIT_INFORMATION),
+        ) == windows.FALSE) {
+            const last_error = windows.GetLastError();
+            if (plan.attach_policy == .hard_fail) return windows.unexpectedError(last_error);
+            log.warn("windows job object limit setup failed; continuing without limits err={}", .{last_error});
+            _ = windows.CloseHandle(handle);
+            return null;
+        }
+    }
+
+    return handle;
+}
+
+pub fn closeWindowsJobObject(self: *Command) void {
+    if (comptime builtin.os.tag != .windows) return;
+    if (self.windows_job_object_handle) |handle| {
+        _ = std.os.windows.CloseHandle(handle);
+        self.windows_job_object_handle = null;
+    }
+}
+
+fn safeWindowsCurrentDirectory(
+    arena: Allocator,
+    path: []const u8,
+    cwd: ?[]const u8,
+) !?[]const u8 {
+    const buf: [:0]const u8 = "C:\\";
+    // var buf: [std.fs.max_path_bytes]u8 = undefined;
+    // const fallback_home = try windows.knownFolderPathUtf8(&windows.FOLDERID_Profile, &buf);
+    const fallback_home = buf;
+    const resolved = safeWindowsCurrentDirectoryWithHome(path, cwd, fallback_home);
+
+    if (resolved) |v| {
+        if (cwd) |existing| {
+            if (mem.eql(u8, v, existing)) return existing;
+        }
+        return try arena.dupe(u8, v);
+    }
+
+    return null;
+}
+
+fn safeWindowsCurrentDirectoryWithHome(
+    path: []const u8,
+    cwd: ?[]const u8,
+    fallback_home: ?[]const u8,
+) ?[]const u8 {
+    const is_wsl = isWindowsWslExecutable(path);
+
+    if (cwd) |v| {
+        if (isWindowsDriveAbsolutePath(v)) return v;
+        if (isObviouslyInvalidWindowsCurrentDirectory(v)) return fallback_home orelse cwd;
+        if (!is_wsl) return cwd;
+    }
+
+    if (is_wsl) return fallback_home orelse cwd;
+    return cwd;
+}
+
+fn isWindowsWslExecutable(path: []const u8) bool {
+    const base = windowsPathBasename(path);
+    return std.ascii.eqlIgnoreCase(base, "wsl.exe") or
+        std.ascii.eqlIgnoreCase(base, "wsl");
+}
+
+fn windowsShouldSearchPath(path: []const u8) bool {
+    if (path.len == 0) return false;
+    if (isWindowsDriveAbsolutePath(path)) return false;
+    if (path.len >= 2 and path[1] == ':') return false;
+    if (std.mem.startsWith(u8, path, "\\\\")) return false;
+    if (path[0] == '\\' or path[0] == '/') return false;
+    return windowsPathBasename(path).len == path.len;
+}
+
+fn isWindowsDriveAbsolutePath(path: []const u8) bool {
+    return path.len >= 3 and
+        std.ascii.isAlphabetic(path[0]) and
+        path[1] == ':' and
+        (path[2] == '\\' or path[2] == '/');
+}
+
+fn isObviouslyInvalidWindowsCurrentDirectory(path: []const u8) bool {
+    return path.len == 0 or
+        mem.eql(u8, path, "\\") or
+        mem.eql(u8, path, "\\\\") or
+        mem.eql(u8, path, "/") or
+        std.mem.startsWith(u8, path, "\\\\wsl.localhost\\") or
+        std.mem.startsWith(u8, path, "\\\\wsl$\\");
+}
+
+fn windowsPathBasename(path: []const u8) []const u8 {
+    var i: usize = path.len;
+    while (i > 0) : (i -= 1) {
+        const c = path[i - 1];
+        if (c == '\\' or c == '/') return path[i..];
+    }
+
+    return path;
 }
 
 fn setupFd(src: File.Handle, target: i32) !void {

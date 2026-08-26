@@ -98,3 +98,4 @@ test "expand: slash" {
     defer testing.allocator.free(path);
     try testing.expect(path.len == 7);
 }
+

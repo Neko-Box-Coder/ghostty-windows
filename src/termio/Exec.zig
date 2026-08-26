@@ -22,6 +22,7 @@ const shell_integration = @import("shell_integration.zig");
 const terminal = @import("../terminal/main.zig");
 const termio = @import("../termio.zig");
 const Command = @import("../Command.zig");
+const windows_shell = configpkg.windows_shell;
 const SegmentedPool = @import("../datastruct/main.zig").SegmentedPool;
 const ptypkg = @import("../pty.zig");
 const Pty = ptypkg.Pty;
@@ -32,6 +33,7 @@ const ProcessInfo = @import("../pty.zig").ProcessInfo;
 const compat_fd = @import("../lib/compat/fd.zig");
 
 const log = std.log.scoped(.io_exec);
+const WindowsJobObjectPlan = if (builtin.os.tag == .windows) apprt.win32_job_object.Plan else void;
 
 /// The termios poll rate in milliseconds.
 const TERMIOS_POLL_MS = 200;
@@ -661,11 +663,13 @@ pub const Config = struct {
     shell_integration_features: configpkg.Config.ShellIntegrationFeatures = .{},
     cursor_blink: ?bool = null,
     working_directory: ?[]const u8 = null,
+    working_directory_home: bool = false,
     resources_dir: ?[]const u8,
     term: []const u8,
 
     rt_pre_exec_info: Command.RtPreExecInfo,
     rt_post_fork_info: Command.RtPostForkInfo,
+    windows_job_object_plan: WindowsJobObjectPlan = if (builtin.os.tag == .windows) .{ .mode = .never } else {},
 };
 
 const Subprocess = struct {
@@ -686,6 +690,7 @@ const Subprocess = struct {
 
     rt_pre_exec_info: Command.RtPreExecInfo,
     rt_post_fork_info: Command.RtPostForkInfo,
+    windows_job_object_plan: WindowsJobObjectPlan,
 
     /// Union that represents the running process type.
     const Process = union(enum) {
@@ -850,10 +855,10 @@ const Subprocess = struct {
         // Setup our shell integration, if we can.
         const shell_command: configpkg.Command = shell: {
             const default_shell_command: configpkg.Command =
-                cfg.command orelse .{ .shell = switch (builtin.os.tag) {
-                    .windows => "cmd.exe",
-                    else => "sh",
-                } };
+                cfg.command orelse switch (builtin.os.tag) {
+                    .windows => try windows_shell.previewCommand(alloc),
+                    else => .{ .shell = "sh" },
+                };
 
             // Always set up shell features (GHOSTTY_SHELL_FEATURES). These are
             // used by both automatic and manual shell integrations.
@@ -905,6 +910,17 @@ const Subprocess = struct {
             break :shell integration.command;
         };
 
+        const launch_command: configpkg.Command = if (builtin.os.tag == .windows)
+            try windows_shell.prepareCommand(
+                alloc,
+                shell_command,
+                cfg.working_directory,
+                cfg.working_directory_home,
+            )
+        else
+            shell_command;
+
+
         // Add the environment variables that override any others.
         {
             var it = cfg.env_override.iterator();
@@ -917,7 +933,7 @@ const Subprocess = struct {
         // Build our args list
         const args: []const [:0]const u8 = execCommand(
             alloc,
-            shell_command,
+            launch_command,
             internal_os.passwd,
         ) catch |err| switch (err) {
             // If we fail to allocate space for the command we want to
@@ -940,12 +956,41 @@ const Subprocess = struct {
             error.SystemError => return err,
         };
 
-        // We have to copy the cwd because there is no guarantee that
-        // pointers in full_config remain valid.
-        const cwd: ?[:0]u8 = if (cfg.working_directory) |cwd|
+        // We separate the terminal-visible PWD from the Windows host cwd.
+        // For WSL launches, the shell may start in `~` or another WSL path
+        // via `wsl.exe --cd ...`, while CreateProcess still needs a valid
+        // Windows-local working directory.
+        const shell_pwd: ?[:0]u8 = if (builtin.os.tag == .windows) pwd: {
+            const resolved = try windows_shell.shellPwd(
+                alloc,
+                cfg.working_directory,
+                windows_shell.isWslCommand(launch_command),
+            );
+            if (resolved) |value| break :pwd try alloc.dupeZ(u8, value);
+            break :pwd null;
+        } else if (cfg.working_directory) |cwd|
             try alloc.dupeZ(u8, cwd)
         else
             null;
+
+        const cwd: ?[:0]u8 = if (builtin.os.tag == .windows) cwd: {
+            const resolved = try windows_shell.safeCurrentDirectory(
+                alloc,
+                cfg.working_directory,
+                cfg.working_directory_home,
+                windows_shell.isWslCommand(launch_command),
+            );
+            if (resolved) |value| break :cwd try alloc.dupeZ(u8, value);
+            break :cwd null;
+        } else shell_pwd;
+
+        if (builtin.os.tag == .windows) {
+            log.info("windows launch host_cwd={?s} shell_pwd={?s} is_wsl={}", .{
+                cwd,
+                shell_pwd,
+                windows_shell.isWslCommand(launch_command),
+            });
+        }
 
         // Propagate the current working directory (CWD) to the shell, enabling
         // the shell to display the current directory name rather than the
@@ -954,7 +999,7 @@ const Subprocess = struct {
         // https://bugs.kde.org/show_bug.cgi?id=242114
         // https://github.com/kovidgoyal/kitty/issues/1595
         // https://github.com/ghostty-org/ghostty/discussions/7769
-        if (cwd) |pwd| try env.put("PWD", pwd);
+        if (shell_pwd) |pwd| try env.put("PWD", pwd);
 
         return .{
             .arena = arena,
@@ -964,6 +1009,7 @@ const Subprocess = struct {
 
             .rt_pre_exec_info = cfg.rt_pre_exec_info,
             .rt_post_fork_info = cfg.rt_post_fork_info,
+            .windows_job_object_plan = cfg.windows_job_object_plan,
 
             // Should be initialized with initTerminal call.
             .grid_size = .{},
@@ -1034,6 +1080,12 @@ const Subprocess = struct {
         // This is important because our cwd can be set by the shell (OSC 7)
         // and we don't want to break new windows.
         const cwd: ?[:0]const u8 = if (self.cwd) |proposed| cwd: {
+            if (comptime builtin.os.tag == .windows) {
+                if (windows_shell.isWslArgv(self.args) and windows_shell.isWslPath(proposed)) {
+                    break :cwd null;
+                }
+            }
+
             if ((comptime build_config.flatpak) and internal_os.isFlatpak()) {
                 // Flatpak sandboxing prevents access to certain reserved paths
                 // regardless of configured permissions. Perform a test spawn
@@ -1112,18 +1164,22 @@ const Subprocess = struct {
             .args = self.args,
             .env = if (self.env) |*env| env else null,
             .cwd = cwd,
-            .stdin = if (builtin.os.tag == .windows) null else .{
-                .handle = pty.slave,
-                .flags = .{ .nonblocking = false },
-            },
-            .stdout = if (builtin.os.tag == .windows) null else .{
-                .handle = pty.slave,
-                .flags = .{ .nonblocking = false },
-            },
-            .stderr = if (builtin.os.tag == .windows) null else .{
-                .handle = pty.slave,
-                .flags = .{ .nonblocking = false },
-            },
+            .stdin = if (builtin.os.tag == .windows) null else .{ .handle = pty.slave },
+            .stdout = if (builtin.os.tag == .windows) null else .{ .handle = pty.slave },
+            .stderr = if (builtin.os.tag == .windows) null else .{ .handle = pty.slave },
+            
+            // .stdin = if (builtin.os.tag == .windows) null else .{
+            //     .handle = pty.slave,
+            //     .flags = .{ .nonblocking = false },
+            // },
+            // .stdout = if (builtin.os.tag == .windows) null else .{
+            //     .handle = pty.slave,
+            //     .flags = .{ .nonblocking = false },
+            // },
+            // .stderr = if (builtin.os.tag == .windows) null else .{
+            //     .handle = pty.slave,
+            //     .flags = .{ .nonblocking = false },
+            // },
             .pseudo_console = if (builtin.os.tag == .windows) pty.pseudo_console else {},
             .os_pre_exec = switch (comptime builtin.os.tag) {
                 .windows => null,
@@ -1145,6 +1201,7 @@ const Subprocess = struct {
             .rt_pre_exec_info = self.rt_pre_exec_info,
             .rt_post_fork = if (comptime @hasDecl(apprt.runtime, "post_fork")) apprt.runtime.post_fork.postFork else null,
             .rt_post_fork_info = self.rt_post_fork_info,
+            .windows_job_object_plan = self.windows_job_object_plan,
             .data = self,
         };
 
@@ -1193,6 +1250,10 @@ const Subprocess = struct {
     /// Called to notify that we exited externally so we can unset our
     /// running state.
     pub fn externalExit(self: *Subprocess) void {
+        switch (self.process orelse return) {
+            .fork_exec => |*cmd| cmd.closeWindowsJobObject(),
+            .flatpak => {},
+        }
         self.process = null;
     }
 
@@ -1247,6 +1308,7 @@ const Subprocess = struct {
     /// process. This also waits for the command to exit and will return the
     /// exit code.
     fn killCommand(command: *Command) !void {
+        defer command.closeWindowsJobObject();
         if (command.pid) |pid| {
             switch (builtin.os.tag) {
                 .windows => {
@@ -2077,52 +2139,26 @@ fn execCommand(
             defer args.deinit(alloc);
 
             if (comptime builtin.os.tag == .windows) {
-                // On Windows we run the shell value directly rather than
-                // wrapping in `cmd.exe /C <shell>`. An intermediate cmd
-                // process is wasteful for the common case (`wsl ~`,
-                // `pwsh -NoLogo`, etc.) and has visible side effects
-                // (extra process in the tree, per-process cmd AutoRun
-                // state not reaching the user's actual shell).
-                //
-                // Values with arguments are split using Windows
-                // command-line quoting rules, so paths containing
-                // spaces can be double-quoted:
-                //
-                //   command = "C:\Program Files\Git\bin\bash.exe" -i -l
-                //
-                // Users who need argv passed through with no parsing
-                // at all should use the direct command form.
-                //
+                // We run our shell wrapped in `cmd.exe` so that we don't have
+                // to parse the command line ourselves if it has arguments.
+
                 // Note we don't free any of the memory below since it is
                 // allocated in the arena.
-                if (std.mem.indexOfAny(u8, v, " \t") == null) {
-                    // No arguments. If the shell is literally "cmd.exe"
-                    // (the default), resolve via %COMSPEC% which is the
-                    // documented path to the current command processor.
-                    // Other values are passed as-is and resolved by
-                    // `internal_os.path.expand` in Command.startWindows.
-                    const argv0 = if (std.ascii.eqlIgnoreCase(v, "cmd.exe"))
-                        global.environ().getAlloc(alloc, "COMSPEC") catch
-                            try alloc.dupe(u8, v)
-                    else
-                        try alloc.dupe(u8, v);
-                    try args.append(alloc, try alloc.dupeZ(u8, argv0));
-                } else {
-                    // Zig 0.16 removed std.process.ArgIteratorGeneral; the
-                    // replacement Windows iterator consumes a UTF-16 command
-                    // line and applies real Windows quoting rules.
-                    const cmd_w = std.unicode.wtf8ToWtf16LeAlloc(alloc, v) catch |err| switch (err) {
-                        error.OutOfMemory => return error.OutOfMemory,
-                        error.InvalidWtf8 => return error.SystemError,
-                    };
-                    defer alloc.free(cmd_w);
-                    var it = try std.process.Args.Iterator.Windows.init(alloc, cmd_w);
-                    defer it.deinit();
-                    while (it.next()) |tok| {
-                        try args.append(alloc, try alloc.dupeZ(u8, tok));
-                    }
-                }
-                break :shell try args.toOwnedSlice(alloc);
+                const windir = global.environ().getAlloc(
+                    alloc,
+                    "WINDIR",
+                ) catch |err| {
+                    log.warn("failed to get WINDIR, cannot run shell command err={}", .{err});
+                    return error.SystemError;
+                };
+                const cmd = try std.fs.path.joinZ(alloc, &[_][]const u8{
+                    windir,
+                    "System32",
+                    "cmd.exe",
+                });
+
+                try args.append(alloc, cmd);
+                try args.append(alloc, "/C");
             } else {
                 // We run our shell wrapped in `/bin/sh` so that we don't have
                 // to parse the command line ourselves if it has arguments.
